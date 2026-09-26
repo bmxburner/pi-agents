@@ -2,7 +2,7 @@
 
 Subagent lifecycle for [pi](https://github.com/earendil-works/pi): spawn, watch, steer, and stop child agents. One surface — the **footer** below the chat input, one line per agent (`↓` to inspect, steer, stop). Orca-only panes; pi in-process by default.
 
-> **Attribution:** pi-agents is a hard adaptation of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) (via [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents)). It also vendors a pinned copy of the [kky42/pi-flow](https://github.com/kky42/pi-flow) spawn core in [`flow/`](flow/) (v3.1.3). Footer folded in from pi-subagents (Phase 4); overlay + sidebar removed (Phase 5); compositor/tool-glow/tool-viz delisted (Phase 6). All three upstreams are MIT; see [NOTICE](NOTICE) for full attribution.
+> **Attribution:** pi-agents is a hard adaptation of [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) (via [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents)). It also vendors a pinned copy of the [kky42/pi-flow](https://github.com/kky42/pi-flow) spawn core in [`flow/`](flow/) (v3.1.3). All three upstreams are MIT; see [NOTICE](NOTICE) for full attribution.
 
 ---
 
