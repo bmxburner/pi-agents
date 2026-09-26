@@ -1,0 +1,422 @@
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  SubagentBackend,
+  SubagentProgressNode,
+  SubagentTelemetry,
+  SubagentToolDetails,
+  SubagentProfileName,
+  SubagentUsage,
+} from "../types.ts";
+
+export const MAX_ACTIVITY_LINES = 2;
+export const MAX_ACTIVITY_LINE_CHARS = 240;
+export const MAX_PROGRESS_METADATA_CHARS = 160;
+export const MAX_PROGRESS_RESULT_CHARS = 2_000;
+export const MAX_PROGRESS_ERROR_CHARS = 1_000;
+export const MAX_PROGRESS_UPDATE_JSON_CHARS = 16_384;
+
+/** Cap for model-visible terminal envelope text, so a runaway child output cannot bloat the root context. */
+export const MAX_MODEL_VISIBLE_TEXT_CHARS = 32_000;
+export const PROGRESS_UPDATE_INTERVAL_MS = 250;
+export const PROGRESS_HEARTBEAT_INTERVAL_MS = 1000;
+
+const TRUNCATED_PROGRESS_SUFFIX = " ... [truncated]";
+
+export function boundedProgressText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  const retainedChars = Math.max(0, maxChars - TRUNCATED_PROGRESS_SUFFIX.length);
+  return `${text.slice(0, retainedChars).trimEnd()}${TRUNCATED_PROGRESS_SUFFIX}`;
+}
+
+export function subagentDisplayDetails(
+  source: SubagentToolDetails,
+  includeDisplayText = true,
+): SubagentToolDetails {
+  const progress = source.progress
+    ? {
+        ...source.progress,
+        label: boundedProgressText(source.progress.label, MAX_PROGRESS_METADATA_CHARS),
+        profile: boundedProgressText(source.progress.profile, MAX_PROGRESS_METADATA_CHARS),
+        activity: includeDisplayText
+          ? source.progress.activity
+              .slice(-MAX_ACTIVITY_LINES)
+              .map((line) => boundedProgressText(line, MAX_ACTIVITY_LINE_CHARS))
+          : [],
+        result: includeDisplayText && source.progress.result !== undefined
+          ? boundedProgressText(source.progress.result, MAX_PROGRESS_RESULT_CHARS)
+          : undefined,
+        error: includeDisplayText && source.progress.error !== undefined
+          ? boundedProgressText(source.progress.error, MAX_PROGRESS_ERROR_CHARS)
+          : undefined,
+        telemetry: source.progress.telemetry ? { ...source.progress.telemetry } : undefined,
+      }
+    : undefined;
+  return {
+    label: boundedProgressText(source.label, MAX_PROGRESS_METADATA_CHARS),
+    profile: boundedProgressText(source.profile, MAX_PROGRESS_METADATA_CHARS),
+    backend: source.backend,
+    status: source.status,
+    result: includeDisplayText && source.result !== undefined
+      ? boundedProgressText(source.result, MAX_PROGRESS_RESULT_CHARS)
+      : undefined,
+    error: includeDisplayText && source.error !== undefined
+      ? boundedProgressText(source.error, MAX_PROGRESS_ERROR_CHARS)
+      : undefined,
+    telemetry: source.telemetry ? { ...source.telemetry } : undefined,
+    progress,
+    activeCount: source.activeCount,
+    frame: source.frame,
+  };
+}
+
+export function textResult(text: string, details: SubagentToolDetails, usage?: SubagentUsage) {
+  const result: {
+    content: [{ type: "text"; text: string }];
+    details: SubagentToolDetails;
+    usage?: SubagentUsage;
+  } = {
+    content: [{ type: "text", text }],
+    details,
+  };
+  if (usage) result.usage = usage;
+  return result;
+}
+
+export type SubagentToolResult = ReturnType<typeof textResult>;
+
+export function createProgressNode(
+  label: string,
+  profile: SubagentProfileName,
+  status: SubagentProgressNode["status"] = "running",
+  backend?: SubagentBackend,
+): SubagentProgressNode {
+  return {
+    label: boundedProgressText(label, MAX_PROGRESS_METADATA_CHARS),
+    profile: boundedProgressText(profile, MAX_PROGRESS_METADATA_CHARS),
+    ...(backend ? { backend } : {}),
+    status,
+    startedAt: Date.now(),
+    activity: [],
+    activityCount: 0,
+  };
+}
+
+function addActivity(progress: SubagentProgressNode, line: string): void {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return;
+  }
+  progress.activityCount++;
+  progress.activity.push(boundedProgressText(normalized, MAX_ACTIVITY_LINE_CHARS));
+  if (progress.activity.length > MAX_ACTIVITY_LINES) {
+    progress.activity.splice(0, progress.activity.length - MAX_ACTIVITY_LINES);
+  }
+}
+
+function replaceLatestActivity(progress: SubagentProgressNode, line: string): void {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return;
+  }
+  if (progress.activity.length === 0) {
+    addActivity(progress, normalized);
+    return;
+  }
+  progress.activity[progress.activity.length - 1] = boundedProgressText(normalized, MAX_ACTIVITY_LINE_CHARS);
+}
+
+function getFirstTextLine(text: string): string {
+  return text.split("\n").find((line) => line.trim()) ?? text;
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((part) => {
+      const block = part as { type?: string; text?: unknown };
+      return block.type === "text" && typeof block.text === "string" ? block.text : undefined;
+    })
+    .filter((part): part is string => part !== undefined)
+    .join("\n")
+    .trim();
+}
+
+function getToolArgPreview(args: unknown): string {
+  if (!args || typeof args !== "object") {
+    return "";
+  }
+  const record = args as Record<string, unknown>;
+  const value =
+    typeof record.label === "string" ? record.label
+    : typeof record.description === "string" ? record.description
+    : typeof record.path === "string" ? record.path
+    : typeof record.command === "string" ? record.command
+    : typeof record.pattern === "string" ? record.pattern
+    : typeof record.query === "string" ? record.query
+    : typeof record.url === "string" ? record.url
+    : "";
+  return value.replace(/\s+/g, " ").trim();
+}
+
+export function updateProgressFromEvent(progress: SubagentProgressNode, event: AgentSessionEvent): void {
+  if (event.type === "tool_execution_start") {
+    if (event.toolName === "run_agent") {
+      return;
+    }
+    const preview = getToolArgPreview(event.args);
+    addActivity(progress, `${event.toolName}${preview ? ` ${preview}` : ""}`);
+    return;
+  }
+
+  if (event.type === "message_start" && event.message.role === "assistant") {
+    addActivity(progress, "Thinking...");
+    return;
+  }
+
+  if (event.type === "tool_execution_update") {
+    return;
+  }
+
+  if (event.type === "tool_execution_end") {
+    return;
+  }
+
+  if (event.type === "message_update") {
+    const assistantEvent = event.assistantMessageEvent;
+    const content =
+      "partial" in assistantEvent ? assistantEvent.partial.content
+      : "message" in assistantEvent ? assistantEvent.message.content
+      : "error" in assistantEvent ? assistantEvent.error.content
+      : undefined;
+    const text = extractTextContent(content);
+    if (text) {
+      replaceLatestActivity(progress, getFirstTextLine(text));
+    }
+    return;
+  }
+
+  if (event.type === "message_end" && event.message.role === "assistant") {
+    const text = extractTextContent(event.message.content);
+    if (text) {
+      replaceLatestActivity(progress, getFirstTextLine(text));
+    }
+  }
+}
+
+export interface ProgressEmitterOptions {
+  label: string;
+  profile: SubagentProfileName;
+  backend?: SubagentBackend;
+  enabled: boolean;
+  onProgress: ((result: SubagentToolResult) => void) | undefined;
+}
+
+export interface ProgressEmitter {
+  readonly progress: SubagentProgressNode | undefined;
+  addActivity(line: string): void;
+  replaceLatestActivity(line: string): void;
+  setUsage(usage: SubagentUsage, telemetry: SubagentTelemetry): void;
+  emit(): void;
+  emitSoon(): void;
+  startHeartbeat(): void;
+  stop(): void;
+}
+
+/**
+ * Keeps backend progress throttling and heartbeat cadence consistent across Pi,
+ * Codex, and Claude. Queue state remains owned by the caller because timeout and
+ * concurrency accounting begin only after a slot is acquired.
+ */
+export function createProgressEmitter(options: ProgressEmitterOptions): ProgressEmitter {
+  const { label, profile, backend, enabled, onProgress } = options;
+  const progress = enabled
+    ? createProgressNode(label, profile, "running", backend)
+    : undefined;
+  const live = Boolean(progress && onProgress);
+
+  let lastProgressEmit = 0;
+  let pendingProgressTimer: ReturnType<typeof setTimeout> | undefined;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let latestUsage: SubagentUsage | undefined;
+
+  const progressUpdate = (source: SubagentProgressNode, includeDisplayText = true): SubagentToolResult => {
+    const details = subagentDisplayDetails({
+      label: source.label,
+      profile: source.profile,
+      ...(backend ? { backend } : {}),
+      status: source.status,
+      result: source.result,
+      error: source.error,
+      telemetry: source.telemetry,
+      progress: source,
+    }, includeDisplayText);
+    const usage = latestUsage ? { ...latestUsage, cost: { ...latestUsage.cost } } : undefined;
+    return textResult(`Subagent "${details.label}" (${details.profile}) is running.`, details, usage);
+  };
+
+  const emit = (): void => {
+    if (!progress || !onProgress) {
+      return;
+    }
+    if (pendingProgressTimer) {
+      clearTimeout(pendingProgressTimer);
+      pendingProgressTimer = undefined;
+    }
+    lastProgressEmit = Date.now();
+    const update = progressUpdate(progress);
+    onProgress(
+      JSON.stringify(update).length <= MAX_PROGRESS_UPDATE_JSON_CHARS
+        ? update
+        : progressUpdate(progress, false),
+    );
+  };
+
+  const emitSoon = (): void => {
+    if (!progress || !onProgress) {
+      return;
+    }
+    const elapsed = Date.now() - lastProgressEmit;
+    if (elapsed >= PROGRESS_UPDATE_INTERVAL_MS) {
+      emit();
+      return;
+    }
+    if (!pendingProgressTimer) {
+      pendingProgressTimer = setTimeout(() => {
+        pendingProgressTimer = undefined;
+        emit();
+      }, PROGRESS_UPDATE_INTERVAL_MS - elapsed);
+    }
+  };
+
+  const startHeartbeat = (): void => {
+    if (!live || heartbeatTimer) {
+      return;
+    }
+    heartbeatTimer = setInterval(() => {
+      emitSoon();
+    }, PROGRESS_HEARTBEAT_INTERVAL_MS);
+    heartbeatTimer.unref?.();
+  };
+
+  const stop = (): void => {
+    if (pendingProgressTimer) {
+      clearTimeout(pendingProgressTimer);
+      pendingProgressTimer = undefined;
+    }
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = undefined;
+    }
+  };
+
+  return {
+    progress,
+    addActivity: (line) => {
+      if (progress) {
+        addActivity(progress, line);
+      }
+    },
+    replaceLatestActivity: (line) => {
+      if (progress) {
+        replaceLatestActivity(progress, line);
+      }
+    },
+    setUsage: (usage, telemetry) => {
+      latestUsage = usage;
+      if (progress) progress.telemetry = telemetry;
+    },
+    emit,
+    emitSoon,
+    startHeartbeat,
+    stop,
+  };
+}
+
+export function extractFinalAssistantText(messages: readonly unknown[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { role?: string; content?: unknown };
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      continue;
+    }
+    const textParts = message.content
+      .map((part) => {
+        const block = part as { type?: string; text?: unknown };
+        return block.type === "text" && typeof block.text === "string" ? block.text : undefined;
+      })
+      .filter((part): part is string => part !== undefined);
+    if (textParts.length > 0) {
+      return textParts.join("\n").trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * Detect a terminal model failure on the final assistant turn.
+ *
+ * pi-ai's stream contract does NOT throw or reject for request/model/runtime
+ * failures (rate limits, quota exhaustion, provider 4xx/5xx, etc.). It encodes
+ * them as a final AssistantMessage with stopReason "error" (or "aborted") and an
+ * errorMessage, so `session.prompt()` resolves normally even when the turn never
+ * produced a real completion. A caller that treats "prompt() resolved" as
+ * success would mark such a run "done" with empty output and zero tokens.
+ *
+ * Returns the failure of the LAST assistant turn (the terminal one), or
+ * undefined when that turn ended normally ("stop"/"length"/"toolUse").
+ */
+export function getFinalAssistantFailure(
+  messages: readonly unknown[],
+): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { role?: string; stopReason?: string; errorMessage?: string };
+    if (message.role !== "assistant") {
+      continue;
+    }
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      return {
+        stopReason: message.stopReason,
+        ...(typeof message.errorMessage === "string" && message.errorMessage
+          ? { errorMessage: message.errorMessage }
+          : {}),
+      };
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+export function getSubagentUsage(session: {
+  getSessionStats: () => {
+    tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    cost: number;
+  };
+  messages?: readonly unknown[];
+}): SubagentUsage {
+  const stats = session.getSessionStats();
+  let reasoning = 0;
+  let reasoningReported = false;
+  for (const raw of session.messages ?? []) {
+    const message = raw as { role?: string; usage?: { reasoning?: number } };
+    if (message.role === "assistant" && typeof message.usage?.reasoning === "number") {
+      reasoning += message.usage.reasoning;
+      reasoningReported = true;
+    }
+  }
+  const totalTokens = stats.tokens.input + stats.tokens.output + stats.tokens.cacheRead + stats.tokens.cacheWrite;
+  return {
+    input: stats.tokens.input,
+    output: stats.tokens.output,
+    cacheRead: stats.tokens.cacheRead,
+    cacheWrite: stats.tokens.cacheWrite,
+    ...(reasoningReported ? { reasoning } : {}),
+    totalTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: stats.cost },
+  };
+}

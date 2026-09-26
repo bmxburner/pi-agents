@@ -1,0 +1,488 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import type { ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { type SubagentToolResult } from "./progress.ts";
+import { spawnCliSubagent, type CliSubagentRunState } from "./cli-spawn.ts";
+import type { SubagentProfile, SubagentTelemetry, SubagentUsage, ThinkingLevel } from "../types.ts";
+
+const CODEX_COMMAND = "codex";
+
+export interface CodexTokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+function parseModelReference(model: string | undefined): { provider?: string; modelId?: string } {
+  const normalized = model?.trim();
+  if (!normalized) {
+    return { provider: undefined, modelId: undefined };
+  }
+  const separator = normalized.indexOf("/");
+  return separator === -1
+    ? { provider: undefined, modelId: normalized }
+    : { provider: normalized.slice(0, separator), modelId: normalized.slice(separator + 1) };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function buildConfigOverrideArg(key: string, rawValue: string): string {
+  return `${key}=${JSON.stringify(rawValue)}`;
+}
+
+function calculateModelCostUsd(pricingModel: Model<string>, usage: CodexTokenUsage): number {
+  const totalInputTokens = Math.max(0, usage.inputTokens);
+  const cachedInputTokens = Math.min(totalInputTokens, Math.max(0, usage.cachedInputTokens));
+  const outputTokens = Math.max(0, usage.outputTokens);
+  const piUsage: Usage = {
+    input: totalInputTokens - cachedInputTokens,
+    output: outputTokens,
+    cacheRead: cachedInputTokens,
+    cacheWrite: 0,
+    totalTokens: totalInputTokens + outputTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  return calculateCost(pricingModel, piUsage).total;
+}
+
+const builtinCodexModelLookup = getBuiltinModel as unknown as (
+  provider: string,
+  modelId: string,
+) => Model<string> | undefined;
+
+// Codex CLI models live in the openai-codex catalog, so a user-written
+// "openai/<model>" or bare "<model>" reference resolves there too.
+export function estimateCodexCostUsd(model: string | undefined, usage: CodexTokenUsage): number | undefined {
+  const { provider, modelId } = parseModelReference(model);
+  if (!modelId) {
+    return undefined;
+  }
+  const providers = provider && provider !== "openai-codex" ? [provider, "openai-codex"] : ["openai-codex"];
+  for (const candidate of providers) {
+    const pricingModel = builtinCodexModelLookup(candidate, modelId);
+    if (pricingModel) {
+      return calculateModelCostUsd(pricingModel, usage);
+    }
+  }
+  return undefined;
+}
+
+function calculateRegistryCodexCostUsd(
+  model: string | undefined,
+  usage: CodexTokenUsage,
+  modelRegistry: ModelRegistry | undefined,
+): number | undefined {
+  if (!modelRegistry) {
+    return undefined;
+  }
+  const { provider, modelId } = parseModelReference(model);
+  if (!modelId) {
+    return undefined;
+  }
+  const providers = provider && provider !== "openai-codex" ? [provider, "openai-codex"] : ["openai-codex"];
+  for (const candidate of providers) {
+    const pricingModel = modelRegistry.find(candidate, modelId);
+    if (pricingModel) {
+      return calculateModelCostUsd(pricingModel, usage);
+    }
+  }
+  return undefined;
+}
+
+function resolveCodexCostUsd(
+  model: string | undefined,
+  usage: CodexTokenUsage,
+  modelRegistry?: ModelRegistry,
+): number | undefined {
+  return calculateRegistryCodexCostUsd(model, usage, modelRegistry) ?? estimateCodexCostUsd(model, usage);
+}
+
+export function codexUsageToSubagentUsage(
+  model: string | undefined,
+  usage: CodexTokenUsage,
+  modelRegistry?: ModelRegistry,
+): SubagentUsage {
+  const totalInputTokens = Math.max(0, usage.inputTokens);
+  const cachedInputTokens = Math.min(totalInputTokens, Math.max(0, usage.cachedInputTokens));
+  const input = totalInputTokens - cachedInputTokens;
+  const output = Math.max(0, usage.outputTokens);
+  const reasoning = Math.min(output, Math.max(0, usage.reasoningOutputTokens));
+  const cost = resolveCodexCostUsd(model, usage, modelRegistry);
+  return {
+    input,
+    output,
+    cacheRead: cachedInputTokens,
+    cacheWrite: 0,
+    ...(reasoning > 0 ? { reasoning } : {}),
+    totalTokens: input + output + cachedInputTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost ?? 0 },
+  };
+}
+
+function codexTelemetry(
+  model: string | undefined,
+  usage: CodexTokenUsage,
+  modelRegistry?: ModelRegistry,
+): SubagentTelemetry {
+  const costKnown = resolveCodexCostUsd(model, usage, modelRegistry) !== undefined;
+  return {
+    tokensKnown: true,
+    costKnown,
+    costBreakdownKnown: false,
+    costEstimated: costKnown,
+  };
+}
+
+export function buildCodexArgs({
+  prompt,
+  profile,
+  thinkingLevel,
+  sessionId,
+  persistSession = false,
+  outputSchemaPath,
+}: {
+  prompt: string;
+  profile: SubagentProfile;
+  thinkingLevel: ThinkingLevel | undefined;
+  sessionId?: string;
+  persistSession?: boolean;
+  outputSchemaPath?: string;
+}): string[] {
+  const args = [
+    "exec",
+  ];
+  if (sessionId) {
+    args.push("resume");
+  }
+  args.push(
+    "--json",
+    "--skip-git-repo-check",
+    "--dangerously-bypass-approvals-and-sandbox",
+  );
+  if (!persistSession && !sessionId) {
+    args.push("--ephemeral");
+  }
+  if (profile.systemPrompt) {
+    args.push("-c", buildConfigOverrideArg("developer_instructions", profile.systemPrompt));
+  }
+  if (profile.model) {
+    args.push("--model", profile.model);
+  }
+  if (thinkingLevel) {
+    args.push("-c", buildConfigOverrideArg("model_reasoning_effort", thinkingLevel));
+  }
+  if (outputSchemaPath) {
+    args.push("--output-schema", outputSchemaPath);
+  }
+  // Use stdin for the task prompt: prompts can be large and may begin with
+  // '-' (bullet lists), both of which are fragile as argv values.
+  void prompt;
+  if (sessionId) {
+    args.push(sessionId, "-");
+  } else {
+    args.push("--", "-");
+  }
+  return args;
+}
+
+export function parseCodexJsonLine(line: string): Record<string, unknown> | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return asRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseUsageRecord(value: unknown): CodexTokenUsage | undefined {
+  const usage = asRecord(value);
+  if (!usage) {
+    return undefined;
+  }
+  const inputTokens = asFiniteNumber(usage.input_tokens);
+  const cachedInputTokens = asFiniteNumber(usage.cached_input_tokens ?? 0);
+  const outputTokens = asFiniteNumber(usage.output_tokens);
+  const reasoningOutputTokens = asFiniteNumber(usage.reasoning_output_tokens ?? 0);
+  if (inputTokens === undefined || cachedInputTokens === undefined || outputTokens === undefined || reasoningOutputTokens === undefined) {
+    return undefined;
+  }
+  return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens };
+}
+
+export function extractCodexSessionId(event: Record<string, unknown>): string | undefined {
+  if (event.type !== "thread.started") {
+    return undefined;
+  }
+  const candidates = [event.thread_id, event.session_id, event.id];
+  return candidates.find((candidate): candidate is string => typeof candidate === "string" && candidate.trim() !== "");
+}
+
+interface CodexTokenCountSnapshot {
+  total?: CodexTokenUsage;
+  last?: CodexTokenUsage;
+}
+
+interface CodexUsageTrackerState {
+  tokenCountBaseline?: CodexTokenUsage;
+  terminalUsageSeen: boolean;
+}
+
+function subtractCodexUsage(total: CodexTokenUsage, baseline: CodexTokenUsage): CodexTokenUsage {
+  return {
+    inputTokens: Math.max(0, total.inputTokens - baseline.inputTokens),
+    cachedInputTokens: Math.max(0, total.cachedInputTokens - baseline.cachedInputTokens),
+    outputTokens: Math.max(0, total.outputTokens - baseline.outputTokens),
+    reasoningOutputTokens: Math.max(0, total.reasoningOutputTokens - baseline.reasoningOutputTokens),
+  };
+}
+
+function extractCodexTokenCountSnapshot(event: Record<string, unknown>): CodexTokenCountSnapshot | undefined {
+  if (event.type !== "event_msg") {
+    return undefined;
+  }
+  const payload = asRecord(event.payload);
+  if (!payload || payload.type !== "token_count") {
+    return undefined;
+  }
+  const info = asRecord(payload.info);
+  if (!info) {
+    return undefined;
+  }
+  const total = parseUsageRecord(info.total_token_usage);
+  const last = parseUsageRecord(info.last_token_usage);
+  return total || last ? { total, last } : undefined;
+}
+
+export function extractCodexUsage(event: Record<string, unknown>): CodexTokenUsage | undefined {
+  if (event.type === "turn.completed") {
+    return parseUsageRecord(event.usage);
+  }
+  const snapshot = extractCodexTokenCountSnapshot(event);
+  return snapshot?.total ?? snapshot?.last;
+}
+
+function extractCodexRunUsage(
+  event: Record<string, unknown>,
+  state: CodexUsageTrackerState,
+): CodexTokenUsage | undefined {
+  if (event.type === "turn.completed") {
+    const usage = parseUsageRecord(event.usage);
+    if (usage) {
+      state.terminalUsageSeen = true;
+    }
+    return usage;
+  }
+  if (state.terminalUsageSeen) {
+    return undefined;
+  }
+  const snapshot = extractCodexTokenCountSnapshot(event);
+  if (!snapshot) {
+    return undefined;
+  }
+  if (!snapshot.total) {
+    return snapshot.last;
+  }
+  if (!state.tokenCountBaseline) {
+    // total_token_usage survives `codex exec resume`; total-minus-last is the
+    // usage that predates this subprocess, which must not be billed again.
+    state.tokenCountBaseline = snapshot.last
+      ? subtractCodexUsage(snapshot.total, snapshot.last)
+      : { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+  }
+  return subtractCodexUsage(snapshot.total, state.tokenCountBaseline);
+}
+
+function textFromCodexValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(textFromCodexValue).filter((part): part is string => part !== undefined);
+    return parts.length > 0 ? parts.join("") : undefined;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  if (typeof record.text === "string") {
+    return record.text;
+  }
+  if (typeof record.message === "string") {
+    return record.message;
+  }
+  if (record.type === "text" && typeof record.content === "string") {
+    return record.content;
+  }
+  return undefined;
+}
+
+function structuredTextFromCodexValue(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+export function extractCodexFinalText(event: Record<string, unknown>): string | undefined {
+  const item = asRecord(event.item);
+  if (event.type !== "item.completed" || !item || item.type !== "agent_message") {
+    return undefined;
+  }
+  return (
+    textFromCodexValue(item.text) ??
+    textFromCodexValue(item.message) ??
+    textFromCodexValue(item.content) ??
+    structuredTextFromCodexValue(item.structured_content) ??
+    ""
+  );
+}
+
+export function extractCodexError(event: Record<string, unknown>): string | undefined {
+  if (event.type === "turn.failed") {
+    const error = asRecord(event.error);
+    return `Codex failed: ${typeof error?.message === "string" ? error.message : "turn failed"}`;
+  }
+  if (event.type === "error") {
+    return `Codex error: ${typeof event.message === "string" ? event.message : "unknown error"}`;
+  }
+  return undefined;
+}
+
+function getPreviewFromRecord(record: Record<string, unknown>): string {
+  const candidates = [
+    record.command,
+    record.cmd,
+    record.path,
+    record.pattern,
+    record.query,
+    record.text,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.replace(/\s+/g, " ").trim();
+    }
+  }
+  const input = asRecord(record.input) ?? asRecord(record.arguments) ?? asRecord(record.args);
+  return input ? getPreviewFromRecord(input) : "";
+}
+
+export function codexActivityFromEvent(event: Record<string, unknown>): string | undefined {
+  if (event.type === "thread.started") {
+    return "codex session started";
+  }
+  if (event.type === "turn.completed") {
+    return "codex turn completed";
+  }
+  const item = asRecord(event.item);
+  if ((event.type === "item.started" || event.type === "item.completed") && item && item.type !== "agent_message") {
+    const itemType = typeof item.type === "string" ? item.type : "item";
+    const preview = getPreviewFromRecord(item);
+    return `${itemType}${preview ? ` ${preview}` : ""}`;
+  }
+  const error = extractCodexError(event);
+  return error ? error : undefined;
+}
+
+async function createOutputSchemaFile(schema: unknown): Promise<{ path: string; cleanup: () => Promise<void> } | undefined> {
+  if (schema === undefined || schema === null) {
+    return undefined;
+  }
+  const dir = await mkdtemp(join(tmpdir(), "pi-subagents-codex-schema-"));
+  const schemaPath = join(dir, "schema.json");
+  await writeFile(schemaPath, JSON.stringify(schema), "utf8");
+  return {
+    path: schemaPath,
+    cleanup: async () => {
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+export async function spawnCodexSubagent(params: {
+  label: string;
+  prompt: string;
+  profile: SubagentProfile;
+  thinkingLevel: ThinkingLevel | undefined;
+  ctx: ExtensionContext;
+  signal: AbortSignal | undefined;
+  progressEnabled: boolean;
+  onProgress: ((result: SubagentToolResult) => void) | undefined;
+  onUsage: (usage: SubagentUsage, telemetry: SubagentTelemetry) => void;
+  appendInstructions?: string;
+  sessionId?: string;
+  persistSession?: boolean;
+  outputSchema?: unknown;
+}): Promise<SubagentToolResult> {
+  const usageTracker: CodexUsageTrackerState = { terminalUsageSeen: false };
+  return spawnCliSubagent({
+    label: params.label,
+    prompt: params.prompt,
+    profile: params.profile,
+    thinkingLevel: params.thinkingLevel,
+    ctx: params.ctx,
+    signal: params.signal,
+    progressEnabled: params.progressEnabled,
+    onProgress: params.onProgress,
+    onUsage: params.onUsage,
+    appendInstructions: params.appendInstructions,
+    sessionId: params.sessionId,
+    persistSession: params.persistSession,
+    adapter: {
+      command: CODEX_COMMAND,
+      buildArgs: async (taskPrompt) => {
+        const schemaFile = await createOutputSchemaFile(params.outputSchema);
+        return {
+          args: buildCodexArgs({
+            prompt: taskPrompt,
+            profile: params.profile,
+            thinkingLevel: params.thinkingLevel,
+            sessionId: params.sessionId?.trim() || undefined,
+            persistSession: params.persistSession === true,
+            outputSchemaPath: schemaFile?.path,
+          }),
+          cleanup: schemaFile?.cleanup,
+        };
+      },
+      isTerminalEvent: (event) => event.type === "turn.completed" || event.type === "turn.failed",
+      parseLine: parseCodexJsonLine,
+      extractSessionId: extractCodexSessionId,
+      extractActivity: codexActivityFromEvent,
+      extractFinalText: extractCodexFinalText,
+      handleEvent: (event, state: CliSubagentRunState) => {
+        const usage = extractCodexRunUsage(event, usageTracker);
+        if (usage) {
+          state.publishUsage(
+            codexUsageToSubagentUsage(params.profile.model, usage, params.ctx.modelRegistry),
+            codexTelemetry(params.profile.model, usage, params.ctx.modelRegistry),
+          );
+        }
+        if (event.type === "turn.failed") {
+          const error = extractCodexError(event);
+          if (error) {
+            state.setEventError(error);
+          }
+        } else if (event.type === "error") {
+          const error = extractCodexError(event);
+          if (error) {
+            state.setDiagnosticError(error);
+          }
+        }
+      },
+    },
+  });
+}

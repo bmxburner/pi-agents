@@ -1,0 +1,185 @@
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { SubagentBackend, SubagentProfile, ThinkingLevel } from "./types.ts";
+
+const VALID_PROFILE_NAME = /^[a-z0-9][a-z0-9-]*$/;
+
+// The esbuild bundle flattens module paths, so the module-relative
+// subagents/ dir resolves wrong when loaded from the bundle. Probe
+// source-layout candidates first, then bundle-layout ones.
+function bundledSubagentsDir(): string {
+  const viaReal = (() => {
+    try { return dirname(realpathSync(fileURLToPath(import.meta.url))); } catch { return undefined; }
+  })();
+  const viaUrl = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(viaUrl, "subagents"),
+    ...(viaReal ? [join(viaReal, "subagents"), join(viaReal, "flow/subagents")] : []),
+    join(viaUrl, "flow/subagents"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return candidates[0];
+}
+
+const BUNDLED_SUBAGENTS_DIR = bundledSubagentsDir();
+
+export function isValidSubagentName(name: string): boolean {
+  return VALID_PROFILE_NAME.test(name);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseThinking(value: unknown): ThinkingLevel | undefined {
+  if (value === undefined || value === null || value === "inherit") {
+    return undefined;
+  }
+  return optionalString(value);
+}
+
+function parseBackend(value: unknown): SubagentBackend | "invalid" {
+  if (value === undefined || value === null || value === "inherit") {
+    return "pi";
+  }
+  const backend = optionalString(value);
+  if (backend === "pi" || backend === "codex" || backend === "claude") {
+    return backend;
+  }
+  return "invalid";
+}
+
+function parseModel(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "inherit") {
+    return undefined;
+  }
+  return optionalString(value);
+}
+
+function parseToolList(value: unknown): string[] | "invalid" {
+  if (typeof value !== "string") {
+    return "invalid";
+  }
+  const tools: string[] = [];
+  const seen = new Set<string>();
+  for (const rawValue of value.split(",")) {
+    const tool = rawValue.trim();
+    if (!tool || seen.has(tool)) {
+      continue;
+    }
+    seen.add(tool);
+    tools.push(tool);
+  }
+  return tools.length > 0 ? tools : "invalid";
+}
+
+function parseProfileFile(filePath: string, name: string, options: { requireBody: boolean }): SubagentProfile | undefined {
+  let content: string;
+  try {
+    content = readFileSync(filePath, "utf-8");
+  } catch {
+    return undefined;
+  }
+
+  let parsed: { frontmatter: Record<string, unknown>; body: string };
+  try {
+    parsed = parseFrontmatter<Record<string, unknown>>(content);
+  } catch {
+    return undefined;
+  }
+
+  const description = optionalString(parsed.frontmatter.description);
+  const body = parsed.body.trim();
+  const backend = parseBackend(parsed.frontmatter.backend);
+  if (backend === "invalid") {
+    return undefined;
+  }
+  const model = parseModel(parsed.frontmatter.model);
+  const thinking = parseThinking(parsed.frontmatter.thinking);
+  const tools = Object.prototype.hasOwnProperty.call(parsed.frontmatter, "tools")
+    ? parseToolList(parsed.frontmatter.tools)
+    : undefined;
+
+  if (!description || tools === "invalid" || (options.requireBody && !body)) {
+    return undefined;
+  }
+
+  return {
+    name,
+    description,
+    backend,
+    model,
+    thinking,
+    tools,
+    systemPrompt: body || undefined,
+  };
+}
+
+export function loadCustomSubagentProfiles(agentDir = getAgentDir()): Map<string, SubagentProfile> {
+  const dir = join(agentDir, "subagents");
+  const profiles = new Map<string, SubagentProfile>();
+  if (!existsSync(dir)) {
+    return profiles;
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return profiles;
+  }
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".md")) {
+      continue;
+    }
+    const name = basename(entry, ".md");
+    if (!isValidSubagentName(name)) {
+      continue;
+    }
+    const profile = parseProfileFile(join(dir, entry), name, { requireBody: false });
+    if (profile) {
+      profiles.set(name, profile);
+    }
+  }
+
+  return profiles;
+}
+
+export function loadBuiltinSubagentProfiles(dir = BUNDLED_SUBAGENTS_DIR): Map<string, SubagentProfile> {
+  const profiles = new Map<string, SubagentProfile>();
+  if (!existsSync(dir)) {
+    return profiles;
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return profiles;
+  }
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".md")) {
+      continue;
+    }
+    const name = basename(entry, ".md");
+    if (!isValidSubagentName(name)) {
+      continue;
+    }
+    const profile = parseProfileFile(join(dir, entry), name, { requireBody: false });
+    if (profile) {
+      profiles.set(name, profile);
+    }
+  }
+
+  return profiles;
+}
+
+export function getSubagentProfiles(agentDir = getAgentDir()): Map<string, SubagentProfile> {
+  return new Map([...loadBuiltinSubagentProfiles(), ...loadCustomSubagentProfiles(agentDir)]);
+}

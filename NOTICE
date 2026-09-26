@@ -1,0 +1,47 @@
+# NOTICE
+
+`pi-agents` is MIT licensed (see [LICENSE](LICENSE), Copyright (c) 2026
+James McCourt). It contains work derived from three upstream projects, all
+MIT licensed. Their original copyright notices are preserved here as
+required by the MIT license terms.
+
+## Derived works in this repository
+
+### pi-agents (this project) — MIT, Copyright (c) 2026 James McCourt
+
+A hard adaptation of the two projects below, with substantial original work:
+in-process `AgentSession` subagents, the steer/abort/resume tool family,
+structured output, turn limits, session persistence, backend selection, and
+the footer-only UI.
+
+### tintinweb/pi-subagents — MIT, Copyright (c) tintinweb
+
+- Repository: https://github.com/tintinweb/pi-subagents
+- Upstream basis for the tool family and the parallel-execution model.
+- The footer UI was folded in from this project (Phase 4).
+
+### HazAT/pi-interactive-subagents — MIT, Copyright (c) HazAT
+
+- Repository: https://github.com/HazAT/pi-interactive-subagents
+- Reached via `tintinweb/pi-subagents`; the interactive/pane-mode lineage
+  informed the interactive subagent paths.
+
+### kky42/pi-flow — MIT, Copyright (c) kky42
+
+- Repository: https://github.com/kky42/pi-flow
+- Vendored copy in [`flow/`](flow/), pinned to tag `v3.1.3`, commit
+  `ef0e8f06ffd9cb962451bb07207919144a904bcd` (2026-08-13).
+- Supplies the spawn core. Adaptations are documented in
+  [`flow/UPSTREAM.md`](flow/UPSTREAM.md).
+- The copy is modified: `workflow/` was dropped (unused) and
+  `core/spawn.ts` / `profiles.ts` carry local deltas.
+
+> **Note on the npm name `pi-flow`:** that package name belongs to an
+> unrelated project. Do not add it as a dependency. This vendored copy, or
+> the pinned git ref above, is the supported source.
+
+## Summary of removals
+
+Relative to the upstreams, this project removed the overlay and sidebar
+(Phase 5) and delisted the compositor / tool-glow / tool-viz surfaces
+(Phase 6).

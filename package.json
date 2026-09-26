@@ -1,0 +1,34 @@
+{
+  "name": "pi-agents",
+  "version": "1.0.0",
+  "description": "Subagent lifecycle for pi: spawn, watch, steer, and stop child agents from the footer.",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "subagents",
+    "orchestration",
+    "agents"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild index.ts --bundle --format=esm --platform=node --target=node24 --external:@earendil-works/* --external:@sinclair/typebox --external:typebox --external:node:* --outfile=index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bmxburner/pi-agents.git"
+  },
+  "author": "James McCourt"
+}

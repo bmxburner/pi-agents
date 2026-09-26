@@ -1,0 +1,7 @@
+node_modules/
+.pi/
+.env
+.DS_Store
+
+# build output (regenerate with `npm run build`)
+index.js
